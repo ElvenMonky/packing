@@ -23,8 +23,8 @@ import pack_vis_sol
 
 
 def plot_lattice(t_same, t_horiz, t_vert, theta_deg, anchor_dx=0.0, anchor_dy=0.0,
-                 n_trees=50, square_size=5.0, ax=None, show_square=True,
-                 show_cell_vectors=True):
+                 n_trees=50, square_size=5.0, p=2.0, shift_dx=0.0, shift_dy=0.0,
+                 ax=None, show_square=True, show_cell_vectors=True):
     """Plot lattice trees using pack_vis_sol conventions.
 
     Args:
@@ -33,6 +33,8 @@ def plot_lattice(t_same, t_horiz, t_vert, theta_deg, anchor_dx=0.0, anchor_dy=0.
         anchor_dx, anchor_dy: anchor offset (80x scale)
         n_trees: number of trees to generate
         square_size: square boundary (Jeroen scale)
+        p: selection shape (1=square, >=sqrt(2)=circle)
+        shift_dx, shift_dy: post-selection shift (80x scale)
         ax: matplotlib Axes (created if None)
         show_square: draw the square boundary
         show_cell_vectors: draw cell vectors from origin
@@ -45,7 +47,7 @@ def plot_lattice(t_same, t_horiz, t_vert, theta_deg, anchor_dx=0.0, anchor_dy=0.
     # Generate tree positions (numpy array, n_trees x 3)
     xyt_np = ppl.generate_lattice_trees(
         t_same, t_horiz, t_vert, theta_deg, anchor_dx, anchor_dy,
-        n_trees, square_size, scale
+        n_trees, square_size, scale, p, shift_dx, shift_dy
     )
 
     # Build TreeList the same way pack_vis_sol does
@@ -174,14 +176,22 @@ def plot_lattice(t_same, t_horiz, t_vert, theta_deg, anchor_dx=0.0, anchor_dy=0.
     return ax
 
 
-def plot_lattice_from_params(params, n_trees=50, square_size=5.0, **kwargs):
-    """Convenience: plot from a 6-element param array.
+def plot_lattice_from_params(params, n_trees=None, square_size=5.0, **kwargs):
+    """Convenience: plot from a 6, 8, or 10 element param array.
 
     Args:
-        params: [t_same, t_horiz, t_vert, theta_deg, anchor_dx, anchor_dy]
+        params: [t_same, t_horiz, t_vert, theta, anchor_dx, anchor_dy,
+                 (n_inner), (p), (shift_dx), (shift_dy)]
+        n_trees: override number of trees (default: params[6] or 50)
     """
+    p = float(params[7]) if len(params) > 7 else 2.0
+    shift_dx = float(params[8]) if len(params) > 8 else 0.0
+    shift_dy = float(params[9]) if len(params) > 9 else 0.0
+    if n_trees is None:
+        n_trees = int(params[6]) if len(params) > 6 else 50
     return plot_lattice(
         params[0], params[1], params[2],
         params[3], params[4], params[5],
-        n_trees=n_trees, square_size=square_size, **kwargs
+        n_trees=n_trees, square_size=square_size, p=p,
+        shift_dx=shift_dx, shift_dy=shift_dy, **kwargs
     )

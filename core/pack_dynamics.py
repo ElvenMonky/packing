@@ -58,6 +58,9 @@ class OptimizerBFGS(kgs.BaseClass):
         ----------
         sol : kgs.SolutionCollection
             Solution collection to optimize (not modified in place).
+            If sol has n_frozen_prefix > 0, the first n_frozen_prefix trees
+            are included in cost computation but their gradients are zeroed
+            (frozen obstacles for edge tree relaxation).
             
         Returns
         -------
@@ -68,6 +71,23 @@ class OptimizerBFGS(kgs.BaseClass):
         sol.check_constraints()
         sol = copy.deepcopy(sol)
         sol.prep_for_phenotype()
+
+        # Detect frozen prefix (lattice trees as obstacles)
+        n_frozen = 0
+        frozen_mask = None  # (N_solutions, N_trees) bool mask
+        if hasattr(sol, 'get_n_frozen'):
+            n_frozen = sol.get_n_frozen()
+        if n_frozen > 0:
+            frozen_xyt = sol.xyt[:, :n_frozen, :].copy()
+            # Build per-solution frozen mask for gradient zeroing
+            if hasattr(sol, 'n_inner_array'):
+                n_inner_arr = sol.n_inner_array
+                N_trees = sol.xyt.shape[1]
+                mask_np = np.zeros((sol.N_solutions, N_trees), dtype=bool)
+                for i in range(sol.N_solutions):
+                    mask_np[i, :n_inner_arr[i]] = True
+                # Expand to (N_solutions, N_trees, 1) for broadcasting with (x,y,theta)
+                frozen_mask = cp.array(mask_np[:, :, np.newaxis], dtype=bool)
 
         sol_tmp = copy.deepcopy(sol)
         counter = 0
@@ -104,6 +124,11 @@ class OptimizerBFGS(kgs.BaseClass):
             # Unflatten state vector (must go via tmp for contiguity)
             tmp_xyt[:N, :] = tmp_x[:N, :N_split].reshape(N, -1, 3)
             tmp_h[:N, :] = tmp_x[:N, N_split:].reshape(N, -1)
+
+            # Reset frozen trees to original positions (prevent drift)
+            if n_frozen > 0:
+                tmp_xyt[:N, :n_frozen, :] = frozen_xyt[:N]
+
             sol_tmp.xyt = tmp_xyt[:N, :]
             sol_tmp.h = tmp_h[:N, :]
 
@@ -111,6 +136,13 @@ class OptimizerBFGS(kgs.BaseClass):
             self.cost.compute_cost(
                 sol_tmp, tmp_cost[:N], tmp_grad[:N, :], tmp_grad_h[:N, :]
             )
+
+            # Zero gradients for frozen trees (per-solution mask)
+            if frozen_mask is not None:
+                # frozen_mask is (N_solutions, N_trees, 1), broadcasts over xyz
+                tmp_grad[:N] = cp.where(frozen_mask[:N], 0.0, tmp_grad[:N])
+            elif n_frozen > 0:
+                tmp_grad[:N, :n_frozen, :] = 0.0
 
             # Flatten gradients to match state vector
             res = cp.zeros_like(tmp_x[:N, :], dtype=kgs.dtype_cp)

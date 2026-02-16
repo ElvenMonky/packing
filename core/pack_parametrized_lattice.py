@@ -4,17 +4,19 @@ Parametrized lattice integration for tree packing GA.
 Ports Serge's NFP-based lattice parametrization from Numba to CuPy/NumPy
 for integration with Jeroen Cottaar's GPU-accelerated GA framework.
 
-The lattice is defined by 6 continuous parameters:
+The lattice is defined by 8 continuous parameters:
   t_same, t_horiz, t_vert: NFP walk parameters [-1, 1]
-  theta:  whole-lattice rotation angle [0, 2*pi]
-  dx, dy: lattice anchor translation from square center
+  theta:  whole-lattice rotation angle [0, 360] degrees
+  dx, dy: lattice anchor translation from square center (80x scale)
+  n_inner: number of lattice-controlled trees (integer stored as float)
+  p: selection shape parameter (1=square, sqrt(2)=circle)
 
-These parameters live in the GA genotype, mutated by GA moves only.
-L-BFGS relaxation operates on the resulting tree xyt positions.
+xyt always holds ALL N_total trees (always-phenotype design):
+  xyt[:, :n_inner, :] = lattice-generated trees (frozen during L-BFGS)
+  xyt[:, n_inner:, :] = free edge trees (optimized by L-BFGS)
 
-Flow:
-  GA mutates lattice_params -> regenerate inner tree xyt ->
-  GPU L-BFGS relaxation (moves ALL trees) -> score
+Lattice mutations update params and regenerate xyt[:, :n_inner].
+n_inner can vary per solution; crossover picks one parent's n_inner.
 
 License: CC BY-SA 4.0 (derivative of Jeroen Cottaar's work)
 """
@@ -342,23 +344,24 @@ def compute_grid_positions(dxs_r, dys_r, dxh_r, dyh_r, dxv_r, dyv_r, max_rc):
 
 @njit
 def generate_lattice_trees(t_same, t_horiz, t_vert, theta, anchor_dx, anchor_dy,
-                           n_inner, square_size, scale=1.0):
+                           n_inner, square_size, scale=1.0, p=2.0,
+                           shift_dx=0.0, shift_dy=0.0):
     """Generate inner tree positions from parametrized lattice.
 
-    Always returns exactly n_inner trees, sorted by distance from anchor.
-    No square boundary filtering — the GA/relaxation handles containment.
+    Always returns exactly n_inner trees, sorted by selection metric.
 
     Args:
         t_same, t_horiz, t_vert: NFP walk parameters [-1, 1]
         theta: lattice rotation angle in DEGREES
-        anchor_dx, anchor_dy: lattice anchor offset in Serge's 80x scale
+        anchor_dx, anchor_dy: lattice anchor offset (80x scale), affects selection
         n_inner: exact number of inner trees to return
         square_size: current square boundary size (in Jeroen's scale)
         scale: coordinate scale factor (1/80)
+        p: selection shape (1=square, >=sqrt(2)=circle)
+        shift_dx, shift_dy: post-selection shift (80x scale), positions cluster in square
 
     Returns:
         xyt: NumPy array (n_inner, 3) in Jeroen's coordinate system
-             [x, y, angle_radians]. Caller converts to CuPy.
     """
     # 1. Compute cell vectors (in Serge's 80x scale)
     dx_same, dy_same, dxh, dyh, dxv, dyv = compute_cell_vectors(
@@ -377,8 +380,6 @@ def generate_lattice_trees(t_same, t_horiz, t_vert, theta, anchor_dx, anchor_dy,
     positions = compute_grid_positions(
         dxs_r, dys_r, dxh_r, dyh_r, dxv_r, dyv_r, max_rc
     )
-    # positions[:, 0:2] = lattice reference point in rotated frame (80x scale)
-    # positions[:, 2] = orientation flag (0=upward, 1=downward)
 
     # 4. Convert lattice positions to tree origins and apply anchor
     orient = positions[:, 2]
@@ -387,16 +388,22 @@ def generate_lattice_trees(t_same, t_horiz, t_vert, theta, anchor_dx, anchor_dy,
     tree_x = positions[:, 0] + bbx * (2 * orient - 1) + adx
     tree_y = positions[:, 1] + bby * (2 * orient - 1) + ady
 
-    # 5. Sort by distance from center, take n_inner closest
-    dist_sq = tree_x**2 + tree_y**2
-    order = np.argsort(dist_sq)
+    # 5. Sort by selection metric: max(p*dx^2, p*dy^2, dx^2+dy^2)
+    # p=1: square selection, p>=sqrt(2): circle selection
+    p_val = float(p)
+    dx2 = tree_x ** 2
+    dy2 = tree_y ** 2
+    dist = np.maximum(p_val * dx2, np.maximum(p_val * dy2, dx2 + dy2))
+    order = np.argsort(dist)
     n_select = min(n_inner, len(order))
     sel = order[:n_select]
 
-    # 6. Build result
+    # 6. Build result with post-selection shift
+    sdx = float(shift_dx)
+    sdy = float(shift_dy)
     result = np.empty((n_select, 3), dtype=np.float64)
-    result[:, 0] = tree_x[sel] * scale
-    result[:, 1] = tree_y[sel] * scale
+    result[:, 0] = (tree_x[sel] + sdx) * scale
+    result[:, 1] = (tree_y[sel] + sdy) * scale
     result[:, 2] = np.where(orient[sel] == 1, np.pi + theta_rad, theta_rad)
 
     return result
@@ -416,119 +423,105 @@ SCALE_FACTOR = 1.0 / 80.0
 # SOLUTION COLLECTION SUBCLASS
 # =============================================================================
 
-N_LATTICE_PARAMS = 6  # [t_same, t_horiz, t_vert, theta, anchor_dx, anchor_dy]
+N_LATTICE_PARAMS = 10
+
+# Parameter indices
+LP_T_SAME = 0
+LP_T_HORIZ = 1
+LP_T_VERT = 2
+LP_THETA = 3
+LP_ANCHOR_DX = 4
+LP_ANCHOR_DY = 5
+LP_N_INNER = 6
+LP_P = 7
+LP_SHIFT_DX = 8
+LP_SHIFT_DY = 9
 
 
 @dataclass
 class SolutionCollectionSquareParametrizedLattice(kgs.SolutionCollectionSquare):
-    """Square boundary with parametrized lattice core.
+    """Square boundary with parametrized lattice core (always-phenotype).
 
-    Genotype: xyt holds ONLY edge trees (N_edge = N_total - n_inner).
-    Phenotype: full N_total trees = lattice-generated + edge trees.
-
-    The lattice params are the genome for inner trees. L-BFGS gradients
-    for inner tree positions are discarded (no backprop to lattice params).
-
+    xyt always holds ALL N_total trees:
+      xyt[:, :n_inner_i, :] = lattice-generated (frozen during L-BFGS)
+      xyt[:, n_inner_i:, :] = free edge trees (optimized by L-BFGS)
+    
+    n_inner is per-solution, stored in lattice_params[:, LP_N_INNER].
+    
     Fields:
-      lattice_params: (N_solutions, 6) lattice parameters
-      n_inner: int, number of trees generated from lattice
+      lattice_params: (N_solutions, 8) lattice parameters
     """
     lattice_params: cp.ndarray = field(init=True, default=None)
-    n_inner: int = field(init=True, default=0)
 
     @property
-    def N_trees(self) -> int:
-        """Total trees in phenotype = lattice + edge."""
-        if self.xyt is None:
-            return 0
-        return self.n_inner + self.xyt.shape[1]
+    def n_inner_array(self):
+        """Per-solution n_inner as numpy int array."""
+        if self.lattice_params is None:
+            return np.zeros(self.N_solutions, dtype=int)
+        return cp.asnumpy(self.lattice_params[:, LP_N_INNER]).astype(int)
+
+    @property
+    def n_inner_max(self):
+        """Maximum n_inner across all solutions (for frozen prefix)."""
+        arr = self.n_inner_array
+        return int(arr.max()) if len(arr) > 0 else 0
 
     def is_phenotype(self):
-        """Genotype != phenotype unless override_phenotype is set.
+        """Always phenotype — xyt holds all trees."""
+        return True
+
+    def regenerate_lattice_trees(self, inds=None):
+        """Regenerate lattice portion of xyt from params.
         
-        During rough relaxation, override_phenotype=True means L-BFGS
-        operates directly on edge trees without generating lattice trees.
+        Args:
+            inds: solution indices to regenerate (None = all)
         """
-        if self.override_phenotype:
-            return True
-        return False
+        if self.lattice_params is None:
+            return
+        if inds is None:
+            inds = range(self.N_solutions)
 
-    def _prep_for_phenotype(self):
-        """Allocate phenotype buffer with full N_trees slots."""
-        N_total = self.N_trees
-        self._prepped_phenotype = kgs.SolutionCollectionSquare()
-        self._prepped_phenotype.xyt = cp.zeros(
-            (self.N_solutions, N_total, 3), dtype=kgs.dtype_cp
-        )
-        self._prepped_phenotype.h = cp.zeros_like(self.h)
-        self._prepped_phenotype.use_fixed_h = self.use_fixed_h
+        n_inner_arr = self.n_inner_array
 
-    def convert_to_phenotype(self):
-        """Always generate full phenotype (lattice + edge trees).
-        
-        Overrides base which would deepcopy self when is_phenotype() is True.
-        We always want to expand lattice params into tree positions.
-        """
-        was_prepped = self._prepped_for_phenotype
-        if not self._prepped_for_phenotype:
-            self.prep_for_phenotype()
-        phenotype = self._convert_to_phenotype()
-        if not was_prepped:
-            self.unprep_for_phenotype()
-        return phenotype
+        for i in inds:
+            i_int = int(i)
+            n_inner_i = n_inner_arr[i_int]
+            if n_inner_i == 0:
+                continue
 
-    def _unprep_for_phenotype(self):
-        self._prepped_phenotype = None
-
-    def _convert_to_phenotype(self):
-        """Generate lattice trees from params, concatenate with edge trees.
-        
-        Handles merged solutions (from run_simulation_list) where 
-        lattice_params may have fewer rows than N_solutions. In that case,
-        wraps lattice_params indices with modulo.
-        """
-        pheno = self._prepped_phenotype
-        pheno.h[:] = self.h
-
-        N_edge = self.xyt.shape[1]
-
-        for i in range(self.N_solutions):
-            params = self.lattice_params[i].get()
-            t_same, t_horiz, t_vert = float(params[0]), float(params[1]), float(params[2])
-            theta, adx, ady = float(params[3]), float(params[4]), float(params[5])
-            square_size = float(self.h[i, 0].get())
+            params = self.lattice_params[i_int].get()
+            t_same = float(params[LP_T_SAME])
+            t_horiz = float(params[LP_T_HORIZ])
+            t_vert = float(params[LP_T_VERT])
+            theta = float(params[LP_THETA])
+            adx = float(params[LP_ANCHOR_DX])
+            ady = float(params[LP_ANCHOR_DY])
+            p = float(params[LP_P])
+            sdx = float(params[LP_SHIFT_DX])
+            sdy = float(params[LP_SHIFT_DY])
+            square_size = float(self.h[i_int, 0].get())
 
             inner_xyt = generate_lattice_trees(
                 t_same, t_horiz, t_vert, theta, adx, ady,
-                self.n_inner, square_size, SCALE_FACTOR
+                n_inner_i, square_size, SCALE_FACTOR, p, sdx, sdy
             )
 
-            n_placed = min(len(inner_xyt), self.n_inner)
+            n_placed = min(len(inner_xyt), n_inner_i)
             if n_placed > 0:
-                pheno.xyt[i, :n_placed, :] = cp.array(inner_xyt[:n_placed], dtype=kgs.dtype_cp)
-            if n_placed < self.n_inner:
-                pheno.xyt[i, n_placed:self.n_inner, :] = 0.0
+                self.xyt[i_int, :n_placed, :] = cp.array(
+                    inner_xyt[:n_placed], dtype=kgs.dtype_cp
+                )
+            if n_placed < n_inner_i:
+                self.xyt[i_int, n_placed:n_inner_i, :] = 0.0
 
-            # Copy edge trees after lattice trees
-            pheno.xyt[i, self.n_inner:, :] = self.xyt[i, :N_edge, :]
-
-        return pheno
-
-    def backprop_phenotype(
-        self, grad_xyt_phenotype, grad_h_phenotype,
-        grad_xyt_genotype, grad_h_genotype
-    ):
-        """Only pass gradients for edge trees. Lattice tree gradients are discarded."""
-        # Edge trees are at positions [n_inner:] in phenotype
-        grad_xyt_genotype[:] = grad_xyt_phenotype[:, self.n_inner:, :]
-        grad_h_genotype[:] = grad_h_phenotype
+    def get_n_frozen(self):
+        """Get max frozen prefix for L-BFGS gradient masking."""
+        return self.n_inner_max
 
     def _check_constraints(self):
-        # Skip parent _check_constraints which validates N_trees against xyt.shape[1]
-        # Our xyt only has edge trees, N_trees includes lattice
         if self.lattice_params is not None:
             if self.lattice_params.shape[0] == self.N_solutions:
-                assert self.lattice_params.shape == (self.N_solutions, N_LATTICE_PARAMS)
+                assert self.lattice_params.shape[1] == N_LATTICE_PARAMS
 
     def select_ids(self, inds):
         super().select_ids(inds)
@@ -558,27 +551,19 @@ class SolutionCollectionSquareParametrizedLattice(kgs.SolutionCollectionSquare):
             self.lattice_params[inds] = other.lattice_params[parent_ids]
 
     def create_empty(self, N_solutions, N_trees):
-        """Allocate with edge-only xyt. N_trees is the TOTAL (lattice + edge)."""
-        N_edge = N_trees - self.n_inner
+        """Allocate with full N_trees xyt (always-phenotype)."""
         res = copy.deepcopy(self)
-        res.xyt = cp.zeros((N_solutions, N_edge, 3), dtype=kgs.dtype_cp)
+        res.xyt = cp.zeros((N_solutions, N_trees, 3), dtype=kgs.dtype_cp)
         res.h = cp.zeros((N_solutions, self._N_h_DOF), dtype=kgs.dtype_cp)
         res.lattice_params = cp.zeros(
             (N_solutions, N_LATTICE_PARAMS), dtype=kgs.dtype_cp
         )
-        res.n_inner = self.n_inner
         return res
 
     def __eq__(self, other):
-        """Equality check that ignores lattice_params.
-        
-        pack_dynamics.run_simulation_list compares solutions after nullifying
-        xyt and h. lattice_params will differ between islands, but that's
-        expected and shouldn't block merging.
-        """
+        """Equality check that ignores lattice_params."""
         if not isinstance(other, SolutionCollectionSquareParametrizedLattice):
             return False
-        # Save and temporarily clear lattice_params
         self_lp, other_lp = self.lattice_params, other.lattice_params
         self.lattice_params = None
         other.lattice_params = None
@@ -590,10 +575,8 @@ class SolutionCollectionSquareParametrizedLattice(kgs.SolutionCollectionSquare):
         return result
 
     def snap(self):
-        """Set h from phenotype bbox."""
-        phenotype = self.convert_to_phenotype()
-        phenotype.snap()
-        self.h[:] = phenotype.h[:]
+        """Set h from bbox of all trees."""
+        super().snap()
 
 
 # =============================================================================
@@ -606,6 +589,7 @@ class InitializerParametrizedLattice(pack_ga3.Initializer):
 
     Each individual gets random lattice parameters which generate inner tree
     positions via NFP-based lattice. Remaining trees are scattered randomly.
+    n_inner and p are per-solution, stored in lattice_params.
     """
 
     base_solution: SolutionCollectionSquareParametrizedLattice = field(
@@ -613,6 +597,7 @@ class InitializerParametrizedLattice(pack_ga3.Initializer):
     )
     fixed_h: cp.ndarray = field(init=True, default=None)
     n_inner_ratio: float = field(init=True, default=0.7)
+    p_range: tuple = field(init=True, default=(1.0, 1.5))
 
     t_range: tuple = field(init=True, default=(-0.5, 0.5))
     anchor_range_ratio: float = field(init=True, default=0.1)
@@ -620,8 +605,6 @@ class InitializerParametrizedLattice(pack_ga3.Initializer):
     def _initialize_population(self, N_individuals, N_trees):
         """Create initial population with parametrized lattice seeds."""
         N_inner = int(N_trees * self.n_inner_ratio)
-        N_edge = N_trees - N_inner
-        self.base_solution.n_inner = N_inner
 
         sol = self.base_solution.create_empty(N_individuals, N_trees)
         sol.h = cp.tile(self.fixed_h[cp.newaxis, :], (N_individuals, 1))
@@ -630,7 +613,7 @@ class InitializerParametrizedLattice(pack_ga3.Initializer):
         square_size = float(cp.asnumpy(self.fixed_h[0]))
 
         lattice_params = np.zeros((N_individuals, N_LATTICE_PARAMS), dtype=np.float64)
-        anchor_range = self.anchor_range_ratio * square_size / SCALE_FACTOR  # in 80x coords
+        anchor_range = self.anchor_range_ratio * square_size / SCALE_FACTOR
 
         for i in range(N_individuals):
             t_same = generator.uniform(*self.t_range)
@@ -639,20 +622,27 @@ class InitializerParametrizedLattice(pack_ga3.Initializer):
             theta = generator.uniform(0, 360)
             adx = generator.uniform(-anchor_range, anchor_range)
             ady = generator.uniform(-anchor_range, anchor_range)
+            p = generator.uniform(*self.p_range)
 
-            lattice_params[i] = [t_same, t_horiz, t_vert, theta, adx, ady]
+            lattice_params[i] = [t_same, t_horiz, t_vert, theta, adx, ady, N_inner, p, 0.0, 0.0]
 
-            # Generate lattice trees (just to compute edge placement radius)
+            # Generate lattice trees
             inner_xyt = generate_lattice_trees(
                 t_same, t_horiz, t_vert, theta, adx, ady,
-                N_inner, square_size, SCALE_FACTOR
+                N_inner, square_size, SCALE_FACTOR, p
             )
 
-            # Fill edge trees randomly (xyt only holds edge trees)
+            # Place lattice trees in first n_inner slots
+            n_placed = min(len(inner_xyt), N_inner)
+            if n_placed > 0:
+                sol.xyt[i, :n_placed, :] = cp.array(inner_xyt[:n_placed], dtype=kgs.dtype_cp)
+
+            # Fill edge trees randomly in remaining slots
+            N_edge = N_trees - N_inner
             edge_xyt = _random_edge_trees(
                 N_edge, square_size, inner_xyt, generator
             )
-            sol.xyt[i, :, :] = cp.array(edge_xyt, dtype=kgs.dtype_cp)
+            sol.xyt[i, N_inner:, :] = cp.array(edge_xyt, dtype=kgs.dtype_cp)
 
         sol.lattice_params = cp.array(lattice_params, dtype=kgs.dtype_cp)
 
@@ -702,13 +692,14 @@ import pack_move
 class LatticeJiggle(pack_move.Move):
     """Small perturbation to lattice parameters.
 
-    Fits into MoveSelector alongside standard tree moves like
-    JiggleRandomTree, Twist, etc. Operates on lattice_params then
-    regenerates inner trees.
+    Jiggles t_same/t_horiz/t_vert, theta, anchor, and p.
+    Does NOT change n_inner (use LatticeResizeInner for that).
+    After jiggling, regenerates lattice trees in xyt.
     """
     t_scale: float = field(init=True, default=0.05)
     theta_scale: float = field(init=True, default=5.0)  # degrees
-    translate_scale_ratio: float = field(init=True, default=0.02)  # fraction of square size in 80x
+    translate_scale_ratio: float = field(init=True, default=0.02)
+    p_scale: float = field(init=True, default=0.05)
 
     def _do_move_vec(self, population, inds_to_do, mate_sol, inds_mate, generator):
         sol = population.genotype
@@ -718,25 +709,38 @@ class LatticeJiggle(pack_move.Move):
             return
 
         N = int(inds_to_do.shape[0])
-        params = sol.lattice_params[inds_to_do]  # (N, 6)
+        params = sol.lattice_params[inds_to_do]  # (N, 8)
 
         # Jiggle t params, clamp to [-1, 1]
-        params[:, 0] += generator.standard_normal(N) * self.t_scale
-        params[:, 1] += generator.standard_normal(N) * self.t_scale
-        params[:, 2] += generator.standard_normal(N) * self.t_scale
-        params[:, :3] = cp.clip(params[:, :3], -1.0, 1.0)
+        params[:, LP_T_SAME] += generator.standard_normal(N) * self.t_scale
+        params[:, LP_T_HORIZ] += generator.standard_normal(N) * self.t_scale
+        params[:, LP_T_VERT] += generator.standard_normal(N) * self.t_scale
+        params[:, LP_T_SAME:LP_T_VERT+1] = cp.clip(
+            params[:, LP_T_SAME:LP_T_VERT+1], -1.0, 1.0
+        )
 
         # Jiggle theta (degrees)
-        params[:, 3] += generator.standard_normal(N) * self.theta_scale
-        params[:, 3] = params[:, 3] % 360.0
+        params[:, LP_THETA] += generator.standard_normal(N) * self.theta_scale
+        params[:, LP_THETA] = params[:, LP_THETA] % 360.0
 
         # Jiggle anchor (80x scale)
         square_sizes_80x = sol.h[inds_to_do, 0] / SCALE_FACTOR
         anchor_scale = square_sizes_80x * self.translate_scale_ratio
-        params[:, 4] += generator.standard_normal(N) * anchor_scale
-        params[:, 5] += generator.standard_normal(N) * anchor_scale
+        params[:, LP_ANCHOR_DX] += generator.standard_normal(N) * anchor_scale
+        params[:, LP_ANCHOR_DY] += generator.standard_normal(N) * anchor_scale
+
+        # Jiggle p, clamp to [1, sqrt(2)]
+        params[:, LP_P] += generator.standard_normal(N) * self.p_scale
+        params[:, LP_P] = cp.clip(params[:, LP_P], 1.0, 1.42)
+
+        # Jiggle shift (80x scale, same scale as anchor)
+        params[:, LP_SHIFT_DX] += generator.standard_normal(N) * anchor_scale
+        params[:, LP_SHIFT_DY] += generator.standard_normal(N) * anchor_scale
 
         sol.lattice_params[inds_to_do] = params
+
+        # Regenerate lattice trees
+        sol.regenerate_lattice_trees(cp.asnumpy(inds_to_do))
 
 
 @dataclass
@@ -754,19 +758,28 @@ class LatticeJump(pack_move.Move):
         square_sizes_80x = sol.h[inds_to_do, 0] / SCALE_FACTOR
         anchor_range = 0.1 * square_sizes_80x
 
-        sol.lattice_params[inds_to_do, 0] = generator.uniform(-0.5, 0.5, N)
-        sol.lattice_params[inds_to_do, 1] = generator.uniform(-0.5, 0.5, N)
-        sol.lattice_params[inds_to_do, 2] = generator.uniform(-0.5, 0.5, N)
-        sol.lattice_params[inds_to_do, 3] = generator.uniform(0, 360, N)
-        sol.lattice_params[inds_to_do, 4] = (generator.uniform(0, 1, N) * 2 - 1) * anchor_range
-        sol.lattice_params[inds_to_do, 5] = (generator.uniform(0, 1, N) * 2 - 1) * anchor_range
+        sol.lattice_params[inds_to_do, LP_T_SAME] = generator.uniform(-0.5, 0.5, N)
+        sol.lattice_params[inds_to_do, LP_T_HORIZ] = generator.uniform(-0.5, 0.5, N)
+        sol.lattice_params[inds_to_do, LP_T_VERT] = generator.uniform(-0.5, 0.5, N)
+        sol.lattice_params[inds_to_do, LP_THETA] = generator.uniform(0, 360, N)
+        sol.lattice_params[inds_to_do, LP_ANCHOR_DX] = (generator.uniform(0, 1, N) * 2 - 1) * anchor_range
+        sol.lattice_params[inds_to_do, LP_ANCHOR_DY] = (generator.uniform(0, 1, N) * 2 - 1) * anchor_range
+        sol.lattice_params[inds_to_do, LP_P] = generator.uniform(1.0, 1.42, N)
+        sol.lattice_params[inds_to_do, LP_SHIFT_DX] = (generator.uniform(0, 1, N) * 2 - 1) * anchor_range
+        sol.lattice_params[inds_to_do, LP_SHIFT_DY] = (generator.uniform(0, 1, N) * 2 - 1) * anchor_range
+        # n_inner unchanged
+
+        sol.regenerate_lattice_trees(cp.asnumpy(inds_to_do))
 
 
 @dataclass
 class LatticeCrossover(pack_move.Move):
-    """Copy entire lattice_params from mate, regenerate inner trees.
+    """Copy entire lattice_params from mate, regenerate lattice trees.
 
-    Takes the mate's lattice structure but keeps edge trees from parent.
+    Takes the mate's lattice structure (including n_inner).
+    When n_inner differs, the boundary between lattice and free trees moves:
+    - If mate has more lattice trees: some free trees become lattice
+    - If mate has fewer: some lattice trees become free (keep positions)
     """
 
     def _do_move_vec(self, population, inds_to_do, mate_sol, inds_mate, generator):
@@ -781,6 +794,41 @@ class LatticeCrossover(pack_move.Move):
             return
 
         sol.lattice_params[inds_to_do] = mate_sol.lattice_params[inds_mate]
+        sol.regenerate_lattice_trees(cp.asnumpy(inds_to_do))
+
+
+@dataclass
+class LatticeResizeInner(pack_move.Move):
+    """Increment or decrement n_inner by 1.
+    
+    Expanding lattice (n_inner += 1): tree at position n_inner becomes
+    lattice-controlled, overwritten by regeneration.
+    
+    Shrinking lattice (n_inner -= 1): tree at position n_inner-1 becomes
+    free, keeps its current position.
+    """
+
+    def _do_move_vec(self, population, inds_to_do, mate_sol, inds_mate, generator):
+        sol = population.genotype
+        if not isinstance(sol, SolutionCollectionSquareParametrizedLattice):
+            return
+        if sol.lattice_params is None:
+            return
+
+        N = int(inds_to_do.shape[0])
+        N_trees = sol.xyt.shape[1]
+
+        # Random +1 or -1 for each individual
+        delta = cp.where(generator.uniform(0, 1, N) < 0.5, -1.0, 1.0)
+        new_n_inner = sol.lattice_params[inds_to_do, LP_N_INNER] + delta
+
+        # Clamp to [1, N_trees - 1] (at least 1 lattice, 1 free)
+        new_n_inner = cp.clip(new_n_inner, 1.0, float(N_trees - 1))
+
+        sol.lattice_params[inds_to_do, LP_N_INNER] = new_n_inner
+
+        # Regenerate lattice trees for changed individuals
+        sol.regenerate_lattice_trees(cp.asnumpy(inds_to_do))
 
 
 # =============================================================================
@@ -796,11 +844,10 @@ def baseline_parametrized_lattice():
     """
     runner = pack_ga3.baseline()
 
-    # Create initializer with our subclass as base_solution
+    # Create base solution (always-phenotype, no genotype/phenotype split)
     base_sol = SolutionCollectionSquareParametrizedLattice()
     base_sol.edge_spacer = kgs.EdgeSpacerDummy()
     base_sol.filter_move_locations_with_edge_spacer = False
-    base_sol.override_phenotype = True  # L-BFGS operates on edge trees only (fast)
 
     initializer = InitializerParametrizedLattice()
     initializer.base_solution = base_sol
@@ -808,17 +855,6 @@ def baseline_parametrized_lattice():
     runner.ga.ga_base.initializer = initializer
 
     # Add lattice moves to the existing MoveSelector
-    # Standard moves (MoveRandomTree, JiggleTree, Twist, Crossover, etc.)
-    # are already there from GASinglePopulationDiversity.__post_init__().
-    # We append lattice-specific moves with moderate weights.
-    #
-    # Weight rationale:
-    #   Standard tree moves total ~11.0 (9 moves, weights 1-2 each)
-    #   LatticeJiggle at 1.5 -> ~12% of moves perturb lattice slightly
-    #   LatticeJump at 0.3   -> ~2.4% of moves do large lattice changes
-    #   LatticeCrossover at 0.5 -> ~4% swap lattice structure from mate
-    #   Total lattice: ~18% of moves affect lattice params
-    #   Remaining 82% are standard tree-level moves (edge + drifted inner)
     move_selector = runner.ga.ga_base.move
     move_selector.moves.append(
         [LatticeJiggle(), 'LatticeJiggle', 1.5]
@@ -828,6 +864,9 @@ def baseline_parametrized_lattice():
     )
     move_selector.moves.append(
         [LatticeCrossover(), 'LatticeCrossover', 0.5]
+    )
+    move_selector.moves.append(
+        [LatticeResizeInner(), 'LatticeResizeInner', 0.3]
     )
     # Force recompute of cached probabilities
     move_selector._probabilities = None
@@ -841,34 +880,25 @@ def baseline_parametrized_lattice():
 # INTEGRATION NOTES
 # =============================================================================
 """
-STATUS: Ready for GPU testing.
+STATUS: Always-phenotype design with per-solution n_inner and selection shape p.
 
-All integration pieces are in place:
-- SolutionCollectionSquareParametrizedLattice carries lattice_params through
-  select_ids, merge, create_clone, create_clone_batch, create_empty
-- LatticeJiggle, LatticeJump, LatticeCrossover are proper pack_move.Move 
-  subclasses wired into MoveSelector via baseline_parametrized_lattice()
-- NFP data, interpolation, and lattice generation ported from Numba to NumPy
+xyt always holds ALL N_total trees:
+  xyt[:, :n_inner, :] = lattice-generated (frozen during L-BFGS)
+  xyt[:, n_inner:, :] = free edge trees (optimized by L-BFGS)
+
+LATTICE PARAMS (8 per solution):
+  [t_same, t_horiz, t_vert, theta, anchor_dx, anchor_dy, n_inner, p]
+  - n_inner: integer (stored as float), varies per solution
+  - p: selection shape (1=square, sqrt(2)=circle), smooth interpolation
+
+MUTATIONS:
+  LatticeJiggle (1.5): small perturbation to t/theta/anchor/p
+  LatticeJump (0.3): large random reset of lattice params
+  LatticeCrossover (0.5): copy entire params from mate
+  LatticeResizeInner (0.3): ±1 to n_inner boundary
 
 USAGE:
     import pack_parametrized_lattice as ppl
     runner = ppl.baseline_parametrized_lattice()
-    runner.run(N_trees=50)  # or whatever API Orchestrator.run() expects
-
-NOTES:
-- compute_collision_penalty is NOT used at runtime. Jeroen's GPU overlap
-  detection handles all collision checking. The penalty function is only
-  called during lattice generation to reject obviously broken lattice configs.
-- regenerate_inner_trees runs on CPU (NumPy). Only called for individuals 
-  that receive a lattice mutation (~18% of offspring). Should be <1ms each.
-- SCALE_FACTOR = 1/80 is hardcoded. Serge's 80x integer coords match
-  Jeroen's unit scale exactly (tip 64->0.8, base 28->0.35).
-
-TUNING KNOBS:
-- n_inner_ratio (default 0.7): fraction of trees placed by lattice vs free
-- Move weights in baseline_parametrized_lattice(): LatticeJiggle 1.5,
-  LatticeJump 0.3, LatticeCrossover 0.5 (~18% total lattice moves)
-- LatticeJiggle scales: t_scale=0.05, theta_scale=0.1, translate_scale=2.0
-- t_range for initialization: (-0.5, 0.5), narrower than full [-1,1]
-  to bias toward reasonable lattices
+    runner.run(N_trees=50)
 """
