@@ -18,6 +18,7 @@ import pack_ga3
 import matplotlib.pyplot as plt
 import pack_vis_sol
 import copy
+print(cp.cuda.get_cuda_path())
 
 
 # Global test configuration

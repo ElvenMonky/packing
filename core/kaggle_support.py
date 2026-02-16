@@ -37,6 +37,12 @@ multiprocess.set_start_method('spawn', force=True)
 if os.path.isdir('/mnt/d/packing/'):
     env = 'local'
     d_drive = '/mnt/d/'
+elif os.path.isdir('/c/GitHub/packing/'):
+    env = 'local'
+    d_drive = '/c/GitHub'
+elif os.path.isdir('C:/GitHub/packing'):
+    env = 'local'
+    d_drive = 'C:/GitHub'
 elif os.path.isdir('/kaggle/working/'):
     env = 'kaggle'
 else:
@@ -50,7 +56,7 @@ match env:
     case 'local':
         data_dir = d_drive + '/packing/data/'
         temp_dir = d_drive + '/packing/temp/'
-        code_dir = d_drive + '/packing/code/core/'
+        code_dir = d_drive + '/packing/core/'
         submission_csv_path = temp_dir + 'submission.csv'
     case 'vast':
         data_dir = '/packing/data/'

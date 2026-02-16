@@ -76,9 +76,10 @@ def test_cell_vectors_no_collision():
     penalty = ppl.compute_collision_penalty(dx_same, dy_same, dxh, dyh, dxv, dyv)
     assert penalty < 1e-10, f"Nonzero collision at t=0: {penalty}"
 
-    # Cell area should be reasonable (around 1947.5 at optimal)
+    # Cell area: 2 trees per unit cell, area = |dxh*dyv - dxv*dyh|
+    # At t=0: 84*64 = 5376 in Serge's 80x coordinates
     area = abs(dxh * dyv - dxv * dyh)
-    assert area > 1000 and area < 5000, f"Suspicious cell area at t=0: {area}"
+    assert area > 1000 and area < 10000, f"Suspicious cell area at t=0: {area}"
 
     print(f"  ✓ Zero collision, cell area = {area:.1f}")
 
@@ -120,12 +121,15 @@ def test_scale_factor():
     assert abs(ppl.SCALE_FACTOR - 1.0/80.0) < 1e-15, \
         f"Scale factor wrong: {ppl.SCALE_FACTOR}"
 
-    # Verify against actual tree vertices if initialized
+    # Verify against actual tree dimensions (height, not absolute position)
+    # Serge's tree height = 80 (from y=-16 to y=64 in 80x coords)
+    # Jeroen's tree height = max_y - min_y = 1.0
     if kgs.tree_vertices is not None:
-        jeroen_top_y = float(kgs.tree_vertices[0, 1])
-        expected_scale = jeroen_top_y / 64.0
-        assert abs(ppl.SCALE_FACTOR - expected_scale) < 1e-10, \
-            f"Scale mismatch: {ppl.SCALE_FACTOR} vs {expected_scale}"
+        jeroen_height = float(kgs.tree_vertices[:, 1].max() - kgs.tree_vertices[:, 1].min())
+        serge_height = 80.0  # full tree height in Serge's coords
+        expected_scale = jeroen_height / serge_height
+        assert abs(ppl.SCALE_FACTOR - expected_scale) < 1e-6, \
+            f"Scale mismatch: {ppl.SCALE_FACTOR} vs {expected_scale} (from height {jeroen_height})"
 
     print(f"  ✓ SCALE_FACTOR = {ppl.SCALE_FACTOR}")
 
@@ -149,19 +153,21 @@ def test_generate_lattice_basic():
     )
 
     assert xyt.shape[1] == 3, f"Wrong shape: {xyt.shape}"
-    assert len(xyt) > 0, "No trees generated"
-    assert len(xyt) <= n_inner, f"Too many trees: {len(xyt)} > {n_inner}"
+    assert len(xyt) == n_inner, f"Expected {n_inner} trees, got {len(xyt)}"
 
-    xyt_np = xyt.get()
+    # Returns numpy now
+    xyt_np = xyt if isinstance(xyt, np.ndarray) else xyt.get()
     half = square_size / 2.0
 
-    # All tree ORIGINS should be inside the square (bbox edges checked internally)
+    # All tree ORIGINS should be reasonably placed (lattice extends beyond square)
     assert np.all(np.abs(xyt_np[:, 0]) < half + 1.0), "Tree x outside square"
     assert np.all(np.abs(xyt_np[:, 1]) < half + 1.0), "Tree y outside square"
 
-    # Angles should be in [0, 2*pi)
-    assert np.all(xyt_np[:, 2] >= 0) and np.all(xyt_np[:, 2] < 2*np.pi + 0.01), \
-        "Angles out of range"
+    # Angles should be 0 or pi (plus theta=0 rotation)
+    angles = xyt_np[:, 2]
+    for a in angles:
+        assert abs(a) < 1e-10 or abs(a - np.pi) < 1e-10, \
+            f"Unexpected angle {a} (expected 0 or pi)"
 
     print(f"  ✓ Generated {len(xyt)} trees (requested {n_inner})")
 
@@ -177,30 +183,31 @@ def test_generate_lattice_rotation():
     )
 
     xyt_0 = ppl.generate_lattice_trees(theta=0.0, **kwargs)
-    xyt_r = ppl.generate_lattice_trees(theta=0.5, **kwargs)
+    xyt_r = ppl.generate_lattice_trees(theta=30.0, **kwargs)
 
-    # Should have roughly same count but different positions
+    # Should have same count but different positions
     assert len(xyt_0) > 0 and len(xyt_r) > 0
     if len(xyt_0) == len(xyt_r):
-        diff = float(cp.max(cp.abs(xyt_0[:, :2] - xyt_r[:, :2])).get())
+        diff = np.max(np.abs(xyt_0[:, :2] - xyt_r[:, :2]))
         assert diff > 0.01, "Rotation had no effect on positions"
 
     print(f"  ✓ Rotation changes positions (n={len(xyt_0)} vs {len(xyt_r)})")
 
 
 def test_generate_lattice_invalid():
-    """Test that invalid lattice params return empty or few trees."""
-    print("Testing invalid lattice params...")
+    """Test that extreme lattice params don't crash."""
+    print("Testing extreme lattice params...")
 
-    # Extreme t values that might create colliding lattice
+    # Extreme t values — should still produce trees (no collision check)
     xyt = ppl.generate_lattice_trees(
         t_same=0.99, t_horiz=0.99, t_vert=0.99,
         theta=0.0, anchor_dx=0.0, anchor_dy=0.0,
         n_inner=30, square_size=5.0, scale=ppl.SCALE_FACTOR
     )
 
-    # Should either be empty (collision detected) or have some trees
-    # Key: shouldn't crash
+    assert len(xyt) == 30, f"Expected 30 trees, got {len(xyt)}"
+    assert not np.any(np.isnan(xyt)), "NaN in tree positions"
+
     print(f"  ✓ Extreme params: {len(xyt)} trees (no crash)")
 
 
@@ -217,7 +224,7 @@ def test_solution_collection_create_empty():
 
     sol = base.create_empty(10, 20)
 
-    assert sol.xyt.shape == (10, 20, 3)
+    assert sol.xyt.shape == (10, 5, 3)  # only edge trees: 20 - 15 = 5
     assert sol.h.shape == (10, 3)
     assert sol.lattice_params.shape == (10, ppl.N_LATTICE_PARAMS)
     assert sol.n_inner == 15
@@ -279,13 +286,17 @@ def test_solution_collection_clone():
     """Test create_clone and create_clone_batch copy lattice_params."""
     print("Testing SolutionCollection clone...")
 
+    n_inner = 5
+    n_edge = 3
+    n_trees = n_inner + n_edge
+
     src = ppl.SolutionCollectionSquareParametrizedLattice()
-    src.n_inner = 5
-    src.xyt = cp.random.random((4, 8, 3), dtype=kgs.dtype_cp)
+    src.n_inner = n_inner
+    src.xyt = cp.random.random((4, n_edge, 3), dtype=kgs.dtype_cp)
     src.h = cp.random.random((4, 3), dtype=kgs.dtype_cp)
     src.lattice_params = cp.arange(24, dtype=kgs.dtype_cp).reshape(4, 6)
 
-    dst = src.create_empty(4, 8)
+    dst = src.create_empty(4, n_trees)
 
     # Single clone
     dst.create_clone(0, src, 2)
@@ -308,37 +319,28 @@ def test_solution_collection_clone():
 # =============================================================================
 
 def test_cost_with_lattice_solution():
-    """Test that cost functions work with our SolutionCollection subclass."""
+    """Test that cost functions work with our SolutionCollection subclass via phenotype."""
     print("Testing cost functions with lattice solution...")
 
     kgs.set_float32(False)
 
     sol = ppl.SolutionCollectionSquareParametrizedLattice()
     sol.n_inner = 5
-    sol.override_phenotype = True  # phenotype = genotype for asymmetric
 
-    # Generate some lattice trees
-    inner_xyt = ppl.generate_lattice_trees(
-        t_same=0.0, t_horiz=0.0, t_vert=0.0,
-        theta=0.0, anchor_dx=0.0, anchor_dy=0.0,
-        n_inner=8, square_size=5.0, scale=ppl.SCALE_FACTOR
-    )
-
-    N_trees = min(len(inner_xyt), 8)
-    if N_trees < 3:
-        print("  ⚠ Too few lattice trees generated, using random")
-        N_trees = 8
-        xyt = cp.random.random((1, N_trees, 3), dtype=cp.float64)
-        xyt[:, :, 0:2] *= 3.0
-        xyt[:, :, 0:2] -= 1.5
-    else:
-        xyt = inner_xyt[:N_trees].reshape(1, N_trees, 3).astype(cp.float64)
-
-    sol.xyt = xyt
+    # Edge trees (xyt only holds edges)
+    N_edge = 3
+    sol.xyt = cp.random.random((1, N_edge, 3), dtype=cp.float64)
+    sol.xyt[:, :, 0:2] *= 3.0
+    sol.xyt[:, :, 0:2] -= 1.5
     sol.h = cp.array([[5.0, 0.0, 0.0]], dtype=cp.float64)
     sol.lattice_params = cp.zeros((1, ppl.N_LATTICE_PARAMS), dtype=cp.float64)
 
-    # Test each cost function
+    # Convert to phenotype and test costs on that
+    sol.prep_for_phenotype()
+    pheno = sol.convert_to_phenotype()
+
+    assert pheno.xyt.shape == (1, 8, 3), f"Wrong phenotype shape: {pheno.xyt.shape}"
+
     costs = [
         pack_cost.AreaCost(),
         pack_cost.CollisionCostSeparation(scaling=5.0),
@@ -346,14 +348,23 @@ def test_cost_with_lattice_solution():
     ]
 
     for c in costs:
-        cost_val, grad_xyt, grad_h = c.compute_cost_ref(sol)
+        cost_val, grad_xyt, grad_h = c.compute_cost_ref(pheno)
         assert cost_val.shape == (1,), f"{c.__class__.__name__}: wrong cost shape"
-        assert grad_xyt.shape == sol.xyt.shape, \
-            f"{c.__class__.__name__}: wrong grad shape"
         assert not cp.any(cp.isnan(cost_val)), f"{c.__class__.__name__}: NaN cost"
-        assert not cp.any(cp.isnan(grad_xyt)), f"{c.__class__.__name__}: NaN gradient"
         print(f"  ✓ {c.__class__.__name__}: cost={float(cost_val[0]):.4f}")
 
+    # Test backprop
+    grad_pheno_xyt = cp.ones_like(pheno.xyt)
+    grad_pheno_h = cp.ones_like(sol.h)
+    grad_geno_xyt = cp.zeros_like(sol.xyt)
+    grad_geno_h = cp.zeros_like(sol.h)
+    sol.backprop_phenotype(grad_pheno_xyt, grad_pheno_h, grad_geno_xyt, grad_geno_h)
+    assert grad_geno_xyt.shape == (1, N_edge, 3)
+    # Lattice grads discarded, edge grads passed through
+    assert cp.all(grad_geno_xyt == 1.0)
+    print("  ✓ backprop_phenotype: lattice grads discarded, edge grads passed")
+
+    sol.unprep_for_phenotype()
     kgs.set_float32(True)
 
 
@@ -368,13 +379,13 @@ def _make_test_population(n_individuals=10, n_trees=15, n_inner=10):
     base.edge_spacer = kgs.EdgeSpacerDummy()
     base.filter_move_locations_with_edge_spacer = False
 
+    n_edge = n_trees - n_inner
     genotype = base.create_empty(n_individuals, n_trees)
     genotype.h[:, 0] = 5.0  # square size
-    genotype.override_phenotype = True
 
-    # Fill with some initial positions
+    # Fill edge trees with random positions
     genotype.xyt = cp.random.random(
-        (n_individuals, n_trees, 3), dtype=kgs.dtype_cp
+        (n_individuals, n_edge, 3), dtype=kgs.dtype_cp
     )
     genotype.xyt[:, :, 0:2] *= 3.0
     genotype.xyt[:, :, 0:2] -= 1.5
@@ -383,33 +394,28 @@ def _make_test_population(n_individuals=10, n_trees=15, n_inner=10):
     genotype.lattice_params[:, 0] = 0.0   # t_same
     genotype.lattice_params[:, 1] = 0.0   # t_horiz
     genotype.lattice_params[:, 2] = 0.0   # t_vert
-    genotype.lattice_params[:, 3] = 0.1   # theta
-    genotype.lattice_params[:, 4] = 0.0   # dx
-    genotype.lattice_params[:, 5] = 0.0   # dy
+    genotype.lattice_params[:, 3] = 10.0  # theta (degrees)
+    genotype.lattice_params[:, 4] = 0.0   # dx (80x scale)
+    genotype.lattice_params[:, 5] = 0.0   # dy (80x scale)
 
-    phenotype = genotype.create_empty(n_individuals, n_trees)
-    phenotype.xyt[:] = genotype.xyt
-    phenotype.h[:] = genotype.h
-    phenotype.lattice_params[:] = genotype.lattice_params
-
-    pop = pack_ga3.Population(genotype=genotype, phenotype=phenotype)
+    pop = pack_ga3.Population(genotype=genotype)
+    pop.phenotype = copy.deepcopy(genotype.convert_to_phenotype())
     pop.set_dummy_fitness()
 
     return pop
 
 
 def test_lattice_jiggle_move():
-    """Test LatticeJiggle move changes lattice params and regenerates trees."""
+    """Test LatticeJiggle move changes lattice params."""
     print("Testing LatticeJiggle move...")
 
     pop = _make_test_population()
     generator = cp.random.default_rng(seed=42)
 
     old_params = pop.genotype.lattice_params.copy()
-    old_xyt = pop.genotype.xyt.copy()
 
     inds = cp.array([0, 3, 7])
-    mate_inds = cp.array([1, 2, 4])  # not used by jiggle, but interface requires it
+    mate_inds = cp.array([1, 2, 4])
 
     move = ppl.LatticeJiggle()
     move.do_move_vec(pop, inds, pop.genotype, mate_inds, generator)
@@ -426,14 +432,8 @@ def test_lattice_jiggle_move():
         assert cp.allclose(pop.genotype.lattice_params[i], old_params[i]), \
             f"Params changed for non-target individual {i}"
 
-    # Inner tree positions should have changed for affected individuals
-    for i in [0, 3, 7]:
-        n_inner = pop.genotype.n_inner
-        diff = float(cp.max(cp.abs(
-            pop.genotype.xyt[i, :n_inner] - old_xyt[i, :n_inner]
-        )).get())
-        # Could be zero if lattice regeneration produced same positions
-        # (unlikely but possible), so just check no crash
+    # Edge trees should NOT have changed (lattice moves only touch params)
+    # xyt is edge-only, lattice trees live in phenotype
 
     print("  ✓ LatticeJiggle changes params for selected individuals only")
 

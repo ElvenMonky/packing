@@ -6,3 +6,5 @@ analysis/profile_report.ncu-rep
 *.nsys-rep
 *.sqlite
 *.png
+temp/*
+nul

@@ -224,6 +224,12 @@ def run_simulation_list(simulator, solution_list):
         merged_sol.xyt = merged_xyt
         merged_sol.h = merged_h
 
+        # Merge any per-solution metadata (e.g. lattice_params)
+        if hasattr(merged_sol, 'lattice_params') and merged_sol.lattice_params is not None:
+            merged_sol.lattice_params = cp.concatenate(
+                [sol.lattice_params for sol in group_sols], axis=0
+            )
+
         # Run simulation on merged batch
         result = simulator.run_simulation(merged_sol)
 
