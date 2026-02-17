@@ -818,8 +818,8 @@ class LatticeResizeInner(pack_move.Move):
         delta = cp.where(generator.uniform(0, 1, N) < 0.5, -1.0, 1.0)
         new_n_inner = sol.lattice_params[inds_to_do, LP_N_INNER] + delta
 
-        # Clamp to [1, N_trees - 1] (at least 1 lattice, 1 free)
-        new_n_inner = cp.clip(new_n_inner, 1.0, float(N_trees - 1))
+        # Clamp to [1, N_trees]
+        new_n_inner = cp.clip(new_n_inner, 1.0, float(N_trees))
 
         sol.lattice_params[inds_to_do, LP_N_INNER] = new_n_inner
 

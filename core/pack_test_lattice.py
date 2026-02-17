@@ -379,11 +379,10 @@ def test_cost_with_lattice_solution():
         assert grad_xyt.shape == (1, N_trees, 3)
         print(f"  ✓ {c.__class__.__name__}: cost={float(cost_val[0]):.4f}")
 
-    # Test n_inner_array and get_n_frozen
+    # Test n_inner_array and n_inner_max
     assert sol.n_inner_array[0] == n_inner
     assert sol.n_inner_max == n_inner
-    assert sol.get_n_frozen() == n_inner
-    print("  ✓ n_inner_array, n_inner_max, get_n_frozen work correctly")
+    print("  ✓ n_inner_array, n_inner_max work correctly")
 
     kgs.set_float32(True)
 
@@ -542,7 +541,7 @@ def test_lattice_resize_inner_move():
         new_val = float(pop.genotype.lattice_params[i, ppl.LP_N_INNER].get())
         assert abs(new_val - old_val) == 1.0, \
             f"Individual {i}: n_inner changed by {new_val - old_val}, expected ±1"
-        assert 1 <= new_val <= 14, f"n_inner out of range: {new_val}"
+        assert 1 <= new_val <= 15, f"n_inner out of range: {new_val}"
 
     for i in [5, 6, 7, 8, 9]:
         assert float(pop.genotype.lattice_params[i, ppl.LP_N_INNER].get()) == \
@@ -614,7 +613,7 @@ def test_ga_parametrized_lattice():
             f"lattice_params wrong shape: {sol.lattice_params.shape}"
         n_inner_arr = sol.n_inner_array
         assert np.all(n_inner_arr >= 1), "n_inner < 1"
-        assert np.all(n_inner_arr < 15), "n_inner >= N_trees"
+        assert np.all(n_inner_arr <= 15), "n_inner > N_trees"
 
     best = np.min(res[:, 0])
     print(f"  ✓ GA completed, best fitness = {best:.6f}")
@@ -668,4 +667,3 @@ def run_all_tests():
     print("=" * 60)
     print("All parametrized lattice tests passed!")
     print("=" * 60)
-    
