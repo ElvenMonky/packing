@@ -11,6 +11,7 @@ L-BFGS implementation for efficient GPU-accelerated gradient descent.
 
 import sys
 import os
+import numpy as np
 sys.path.insert(0, os.path.join(os.getcwd(), '../core'))
 import kaggle_support as kgs
 import cupy as cp
@@ -78,7 +79,7 @@ class OptimizerBFGS(kgs.BaseClass):
         if hasattr(sol, 'get_n_frozen'):
             n_frozen = sol.get_n_frozen()
         if n_frozen > 0:
-            frozen_xyt = sol.xyt[:, :n_frozen, :].copy()
+            frozen_xyt = sol.xyt.copy()  # full copy, mask selects which to reset
             # Build per-solution frozen mask for gradient zeroing
             if hasattr(sol, 'n_inner_array'):
                 n_inner_arr = sol.n_inner_array
@@ -109,6 +110,7 @@ class OptimizerBFGS(kgs.BaseClass):
         tmp_grad = cp.zeros_like(sol.xyt, dtype=kgs.dtype_cp)
         tmp_grad_h = cp.zeros_like(sol.h, dtype=kgs.dtype_cp)
 
+
         # Cost and gradient function for L-BFGS
         def f_torch(x, is_main_loop):
             """Compute cost and gradient for L-BFGS optimizer."""
@@ -126,7 +128,9 @@ class OptimizerBFGS(kgs.BaseClass):
             tmp_h[:N, :] = tmp_x[:N, N_split:].reshape(N, -1)
 
             # Reset frozen trees to original positions (prevent drift)
-            if n_frozen > 0:
+            if frozen_mask is not None:
+                tmp_xyt[:N] = cp.where(frozen_mask[:N], frozen_xyt[:N], tmp_xyt[:N])
+            elif n_frozen > 0:
                 tmp_xyt[:N, :n_frozen, :] = frozen_xyt[:N]
 
             sol_tmp.xyt = tmp_xyt[:N, :]
@@ -272,3 +276,4 @@ def run_simulation_list(simulator, solution_list):
             sol.xyt[:] = result.xyt[start_idx:start_idx + N_sol]
             sol.h[:] = result.h[start_idx:start_idx + N_sol]
             start_idx += N_sol
+            
