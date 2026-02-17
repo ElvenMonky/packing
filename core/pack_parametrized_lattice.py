@@ -514,10 +514,6 @@ class SolutionCollectionSquareParametrizedLattice(kgs.SolutionCollectionSquare):
             if n_placed < n_inner_i:
                 self.xyt[i_int, n_placed:n_inner_i, :] = 0.0
 
-    def get_n_frozen(self):
-        """Get max frozen prefix for L-BFGS gradient masking."""
-        return self.n_inner_max
-
     def _check_constraints(self):
         if self.lattice_params is not None:
             if self.lattice_params.shape[0] == self.N_solutions:
