@@ -473,6 +473,11 @@ class SolutionCollectionSquareParametrizedLattice(kgs.SolutionCollectionSquare):
     def regenerate_lattice_trees(self, inds=None):
         """Regenerate lattice portion of xyt from params.
         
+        Sorts existing trees by distance from lattice center (using the same
+        rounded-square metric as lattice selection). Closest n_inner trees get
+        overwritten with lattice positions, farthest N-n_inner keep their
+        current positions as free trees.
+        
         Args:
             inds: solution indices to regenerate (None = all)
         """
@@ -482,6 +487,7 @@ class SolutionCollectionSquareParametrizedLattice(kgs.SolutionCollectionSquare):
             inds = range(self.N_solutions)
 
         n_inner_arr = self.n_inner_array
+        N_trees = self.xyt.shape[1]
 
         for i in inds:
             i_int = int(i)
@@ -501,18 +507,36 @@ class SolutionCollectionSquareParametrizedLattice(kgs.SolutionCollectionSquare):
             sdy = float(params[LP_SHIFT_DY])
             square_size = float(self.h[i_int, 0].get())
 
+            # Generate lattice positions
             inner_xyt = generate_lattice_trees(
                 t_same, t_horiz, t_vert, theta, adx, ady,
                 n_inner_i, square_size, SCALE_FACTOR, p, sdx, sdy
             )
 
+            # Compute lattice center in Jeroen coords
+            cx = sdx * SCALE_FACTOR
+            cy = sdy * SCALE_FACTOR
+
+            # Sort existing trees by distance from lattice center
+            # using same rounded-square metric
+            cur_xyt = self.xyt[i_int].get()  # (N_trees, 3)
+            dx = cur_xyt[:, 0] - cx
+            dy = cur_xyt[:, 1] - cy
+            dx2 = dx ** 2
+            dy2 = dy ** 2
+            dist = np.maximum(p * dx2, np.maximum(p * dy2, dx2 + dy2))
+            order = np.argsort(dist)
+
+            # Reorder: closest trees first (will be overwritten by lattice),
+            # farthest trees last (keep as free)
+            reordered = cur_xyt[order]
+
+            # Overwrite closest n_inner with lattice positions
             n_placed = min(len(inner_xyt), n_inner_i)
             if n_placed > 0:
-                self.xyt[i_int, :n_placed, :] = cp.array(
-                    inner_xyt[:n_placed], dtype=kgs.dtype_cp
-                )
-            if n_placed < n_inner_i:
-                self.xyt[i_int, n_placed:n_inner_i, :] = 0.0
+                reordered[:n_placed] = inner_xyt[:n_placed]
+
+            self.xyt[i_int] = cp.array(reordered, dtype=kgs.dtype_cp)
 
     def _check_constraints(self):
         if self.lattice_params is not None:

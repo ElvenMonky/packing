@@ -610,7 +610,6 @@ class GA(kgs.BaseClass):
             for xx in self.best_costs_per_generation_ax:
                 ax = plot_ax[xx[2]]
                 ax.clear()
-                ax.set_ylim(0.32, 0.4)
                 plt.sca(ax)
                 to_plot = np.array(
                     [[y[xx[0]] for y in x] for x in self.best_costs_per_generation]
@@ -867,7 +866,7 @@ class GAMulti(GA):
                 if xx[1]:
                     to_plot = np.log(to_plot) / np.log(10)
                 im = plt.imshow(
-                    to_plot.T, aspect='auto', cmap='viridis', interpolation='none', vmin=0.32, vmax=0.4
+                    to_plot.T, aspect='auto', cmap='viridis', interpolation='none'
                 )
                 if not hasattr(ax, '_colorbar') or ax._colorbar is None:
                     ax._colorbar = plt.colorbar(im, ax=ax, label='Best cost')
